@@ -34,6 +34,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	ks3awserr "github.com/ks3sdklib/aws-sdk-go/aws/awserr"
 	"github.com/pingcap/errors"
 	backuppb "github.com/pingcap/kvproto/pkg/brpb"
 	"github.com/pingcap/log"
@@ -683,6 +684,103 @@ func TestKS3CreateHonorsPartSize(t *testing.T) {
 		"2": partSize,
 		"3": 1024,
 	}, uploadedPartSizes)
+}
+
+func TestKS3CopyFrom(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		copyErrors  []string
+		deleteError string
+		wantError   string
+		wantMethods []string
+	}{
+		{name: "success", wantMethods: []string{"PUT"}},
+		{name: "access denied", copyErrors: []string{"AccessDenied"}, wantError: "AccessDenied", wantMethods: []string{"PUT"}},
+		{name: "missing source", copyErrors: []string{"NoSuchKey"}, wantError: "NoSuchKey", wantMethods: []string{"PUT"}},
+		{name: "existing object", copyErrors: []string{"ObjectAlreadyExists"}, wantMethods: []string{"PUT", "DELETE", "PUT"}},
+		{name: "legacy existing object", copyErrors: []string{"ObjectAlreayExists"}, wantMethods: []string{"PUT", "DELETE", "PUT"}},
+		{name: "delete fails", copyErrors: []string{"ObjectAlreadyExists"}, deleteError: "AccessDenied", wantError: "AccessDenied", wantMethods: []string{"PUT", "DELETE"}},
+		{name: "retry fails", copyErrors: []string{"ObjectAlreadyExists", "AccessDenied"}, wantError: "AccessDenied", wantMethods: []string{"PUT", "DELETE", "PUT"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var methods []string
+			copyCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				methods = append(methods, r.Method)
+				if r.URL.Path != "/bucket/prefix/to" {
+					t.Errorf("unexpected object path: %s", r.URL.Path)
+				}
+				var code string
+				switch r.Method {
+				case http.MethodPut:
+					if source := r.Header.Get("X-Amz-Copy-Source"); source != "bucket/prefix/from" {
+						t.Errorf("unexpected copy source: %s", source)
+					}
+					if copyCalls < len(test.copyErrors) {
+						code = test.copyErrors[copyCalls]
+					}
+					copyCalls++
+				case http.MethodDelete:
+					code = test.deleteError
+				default:
+					t.Errorf("unexpected request method: %s", r.Method)
+					code = "AccessDenied"
+				}
+				w.Header().Set("Content-Type", "application/xml")
+				if code != "" {
+					status := http.StatusConflict
+					switch code {
+					case "AccessDenied":
+						status = http.StatusForbidden
+					case "NoSuchKey":
+						status = http.StatusNotFound
+					}
+					w.WriteHeader(status)
+					_, err := fmt.Fprintf(w, "<Error><Code>%s</Code><Message>copy test error</Message></Error>", code)
+					if err != nil {
+						t.Errorf("write error response: %v", err)
+					}
+					return
+				}
+				if r.Method == http.MethodDelete {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				_, err := fmt.Fprint(w, `<CopyObjectResult><ETag>"etag"</ETag><LastModified>2026-01-01T00:00:00Z</LastModified></CopyObjectResult>`)
+				if err != nil {
+					t.Errorf("write copy response: %v", err)
+				}
+			}))
+			defer server.Close()
+
+			ctx := context.Background()
+			storage, err := NewKS3Storage(ctx, &backuppb.S3{
+				Region:          "test-region",
+				Endpoint:        server.URL,
+				Bucket:          "bucket",
+				Prefix:          "prefix",
+				AccessKey:       "access-key",
+				SecretAccessKey: "secret-access-key",
+				ForcePathStyle:  true,
+			}, &storeapi.Options{})
+			require.NoError(t, err)
+
+			err = storage.CopyFrom(ctx, storage, storeapi.CopySpec{From: "from", To: "to"})
+			if test.wantError != "" {
+				var sdkErr ks3awserr.Error
+				require.ErrorAs(t, err, &sdkErr)
+				require.Equal(t, test.wantError, sdkErr.Code())
+			} else {
+				require.NoError(t, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			require.Equal(t, test.wantMethods, methods)
+		})
+	}
 }
 
 func mockGetObject(t *testing.T, s3api *mock.MockS3API, times int) {
