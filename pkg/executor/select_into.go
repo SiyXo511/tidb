@@ -121,6 +121,8 @@ func (s *SelectIntoExec) escapeField(f []byte) []byte {
 	return s.escapeBuf
 }
 
+// dumpToOutfile writes the current chunk using the configured OUTFILE format.
+// Line prefixes are written literally, outside field escaping and enclosure.
 func (s *SelectIntoExec) dumpToOutfile() error {
 	encloseFlag := false
 	var encloseByte byte
